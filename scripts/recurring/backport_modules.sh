@@ -8,8 +8,9 @@
 #
 # Usage:
 #   ./backport_modules.sh              (syncs from detected source version to all found versions)
-#   ./backport_modules.sh v2.11 v2.12    (syncs from detected source version to only v2.11 and v2.12)
+#   ./backport_modules.sh v2.11 v2.12  (syncs from detected source version to only v2.11 and v2.12)
 #   ./backport_modules.sh --from next  (syncs from 'next' to all found versions)
+#   ./backport_modules.sh --commit 2dde091 (syncs changes from a specific commit)
 #   ./backport_modules.sh --help       (shows this help message)
 #   ./backport_modules.sh --staged     (syncs only staged files)
 
@@ -54,6 +55,7 @@ show_usage() {
   echo "Options:"
   echo "  -h, --help           Show this help message and exit."
   echo "  -f, --from VERSION   Specify the source version name (autodetected if not specified)."
+  echo "  -c, --commit COMMIT  Specify a commit to sync changes from (mutually exclusive with --staged)."
   echo "  --staged             Only process files that are staged for commit."
   echo ""
   echo "Examples:"
@@ -63,6 +65,9 @@ show_usage() {
   echo "  # Sync from detected source version only to specific versions"
   echo "  $(basename "$0") v2.11 v2.12"
   echo ""
+  echo "  # Sync changes from a specific commit"
+  echo "  $(basename "$0") --commit 2dde091d3"
+  echo ""
   echo "  # Sync from 'next' to all default target versions"
   echo "  $(basename "$0") --from next"
 }
@@ -71,6 +76,8 @@ show_usage() {
 # --- Argument Parsing ---
 SOURCE_VERSION_NAME="" # Default value (empty means autodetect)
 STAGED_ONLY=false
+COMMIT_REF=""
+COMMIT_HASH=""
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
   key="$1"
@@ -85,6 +92,15 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       SOURCE_VERSION_NAME="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    -c|--commit)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        print_error "Option '$1' requires an argument."
+        exit 1
+      fi
+      COMMIT_REF="$2"
       shift # past argument
       shift # past value
       ;;
@@ -113,6 +129,21 @@ if [ ! -d .git ]; then
   exit 1
 fi
 
+# Validate mutually exclusive options
+if [ -n "$COMMIT_REF" ] && [ "$STAGED_ONLY" = true ]; then
+  print_error "Options '--commit' and '--staged' are mutually exclusive."
+  exit 1
+fi
+
+# Validate commit reference if provided
+if [ -n "$COMMIT_REF" ]; then
+  COMMIT_HASH=$(git rev-parse --verify --quiet "$COMMIT_REF^{commit}")
+  if [ -z "$COMMIT_HASH" ]; then
+    print_error "Invalid commit reference '$COMMIT_REF'."
+    exit 1
+  fi
+fi
+
 # --- Dynamic Version Detection ---
 VERSIONS_DIR_BASE=""
 if [ -d "versions" ]; then
@@ -126,7 +157,10 @@ fi
 
 # Detect Source Version if not specified
 if [ -z "$SOURCE_VERSION_NAME" ]; then
-  if [ "$STAGED_ONLY" = true ]; then
+  if [ -n "$COMMIT_HASH" ]; then
+    print_message "Attempting to detect source version from commit '$COMMIT_REF'..."
+    staged_files_all=$(git diff-tree --no-commit-id --name-only -r --diff-filter=AM "$COMMIT_HASH")
+  elif [ "$STAGED_ONLY" = true ]; then
     print_message "Attempting to detect source version from staged files..."
     staged_files_all=$(git diff --name-only --diff-filter=AM --cached)
   else
@@ -135,12 +169,15 @@ if [ -z "$SOURCE_VERSION_NAME" ]; then
   fi
 
   if [ -z "$staged_files_all" ]; then
-    print_error "No modified/staged files found. Cannot detect source version."
+    if [ -n "$COMMIT_HASH" ]; then
+      print_error "No modified/added files found in commit '$COMMIT_REF'. Cannot detect source version."
+    else
+      print_error "No modified/staged files found. Cannot detect source version."
+    fi
     exit 1
   fi
 
   # Extract unique versions from paths starting with VERSIONS_DIR_BASE
-  detected_versions=$(echo "$staged_files_all" | grep "^$VERSIONS_DIR_BASE/" | cut -d/ -f2 | sort -u)
   raw_versions=$(echo "$staged_files_all" | grep "^$VERSIONS_DIR_BASE/" | cut -d/ -f2 | sort -u)
   detected_versions=$(for ver in $raw_versions; do
     if is_valid_version "$ver"; then
@@ -152,10 +189,18 @@ if [ -z "$SOURCE_VERSION_NAME" ]; then
   version_count=$(echo "$detected_versions" | grep -cve '^\s*$')
 
   if [ "$version_count" -eq 0 ]; then
-    print_error "No modified/staged files found inside '$VERSIONS_DIR_BASE/'. Cannot detect source version."
+    if [ -n "$COMMIT_HASH" ]; then
+      print_error "No modified/added files found inside '$VERSIONS_DIR_BASE/' in commit '$COMMIT_REF'. Cannot detect source version."
+    else
+      print_error "No modified/staged files found inside '$VERSIONS_DIR_BASE/'. Cannot detect source version."
+    fi
     exit 1
   elif [ "$version_count" -gt 1 ]; then
-    print_error "Multiple source versions detected in modified/staged files: $(echo $detected_versions | tr '\n' ' '). Please specify source version manually using --from."
+    if [ -n "$COMMIT_HASH" ]; then
+      print_error "Multiple source versions detected in commit '$COMMIT_REF': $(echo $detected_versions | tr '\n' ' '). Please specify source version manually using --from."
+    else
+      print_error "Multiple source versions detected in modified/staged files: $(echo $detected_versions | tr '\n' ' '). Please specify source version manually using --from."
+    fi
     exit 1
   else
     SOURCE_VERSION_NAME=$(echo "$detected_versions" | tr -d '[:space:]')
@@ -219,7 +264,10 @@ print_message "Starting sync of files from '$SOURCE_VERSION_NAME'..."
 print_message "Target versions: ${TARGET_VERSIONS[*]}"
 echo "-----------------------------------------------------"
 
-if [ "$STAGED_ONLY" = true ]; then
+if [ -n "$COMMIT_HASH" ]; then
+  # Get a list of files modified/added in the specified commit within the specified source path
+  staged_files=$(git diff-tree --no-commit-id --name-only -r --diff-filter=AM "$COMMIT_HASH" -- "$SOURCE_PATH")
+elif [ "$STAGED_ONLY" = true ]; then
   # Get a list of files staged for commit within the specified source path
   staged_files=$(git diff --name-only --diff-filter=AM --cached -- "$SOURCE_PATH"**)
 else
@@ -228,13 +276,27 @@ else
 fi
 
 if [ -z "$staged_files" ]; then
-  print_message "No modified files found in '$SOURCE_PATH'. Nothing to do."
+  if [ -n "$COMMIT_HASH" ]; then
+    print_message "No modified/added files found in '$SOURCE_PATH' for commit '$COMMIT_REF'. Nothing to do."
+  else
+    print_message "No modified files found in '$SOURCE_PATH'. Nothing to do."
+  fi
   exit 0
 fi
 
 # Loop through each staged file
 while IFS= read -r file; do
-  if [ -f "$file" ]; then # Check if the item is a file
+  [ -z "$file" ] && continue
+  file_exists=false
+  if [ -n "$COMMIT_HASH" ]; then
+    if git cat-file -e "$COMMIT_HASH:$file" 2>/dev/null; then
+      file_exists=true
+    fi
+  elif [ -f "$file" ]; then
+    file_exists=true
+  fi
+
+  if [ "$file_exists" = true ]; then
     echo
     print_message "Processing: $file"
 
@@ -255,7 +317,9 @@ while IFS= read -r file; do
         patch_file=$(mktemp)
 
         # Generate the patch
-        if [ "$STAGED_ONLY" = true ]; then
+        if [ -n "$COMMIT_HASH" ]; then
+          git diff-tree --no-commit-id -p "$COMMIT_HASH" -- "$file" > "$patch_file"
+        elif [ "$STAGED_ONLY" = true ]; then
           git diff --no-color --cached -- "$file" > "$patch_file"
         else
           git diff --no-color HEAD -- "$file" > "$patch_file"
@@ -286,7 +350,11 @@ while IFS= read -r file; do
         fi
 
         # Copy the source file to the destination
-        cp "$file" "$dest_file"
+        if [ -n "$COMMIT_HASH" ]; then
+          git show "$COMMIT_HASH:$file" > "$dest_file"
+        else
+          cp "$file" "$dest_file"
+        fi
         echo "  - Copied to: $dest_file"
       fi
     done
